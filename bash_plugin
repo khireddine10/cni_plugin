@@ -1,0 +1,129 @@
+#!/bin/bash
+log=/var/log/cni.log
+config=`cat /dev/stdin`
+main_interface=`ip route | awk '/^default/{print $5}'`
+net_mask=`cat /etc/cni/net.d/plugin_configuration.conf | jq -r '.podcidr | split("/") | last'`
+net_ip=`cat /etc/cni/net.d/plugin_configuration.json | jq -r '.podcidr' | cut -d '.' -f 1,2`
+main_node_ip=`hostname -I | awk '{print $1}'`
+podcidr=`cat /etc/cni/net.d/plugin_configuration.json | jq -r '.podcidr'`
+echo >> $log
+echo "COMMAND: $CNI_COMMAND" >> $log
+
+
+configure_host_firewall(){
+    #!/bin/bash
+    iptables -A FORWARD -s $net_ip.0.0/16 -j ACCEPT
+    iptables -A FORWARD -d $net_ip.0.0/16 -j ACCEPT
+
+    # 10.244.3.0 is a static
+    ip route add 10.244.3.0/24 via $main_node_ip dev enp0s3
+
+    sudo iptables -A FORWARD -i cni0 -p tcp --dport 9999 -j ACCEPT
+    sudo iptables -A FORWARD -o cni0 -p tcp --dport 9999 -j ACCEPT
+
+    # Allow outgoing internet 
+    iptables -t nat -A POSTROUTING -s $podcidr ! -o cni0 -j MASQUERADE
+}
+
+case $CNI_COMMAND in
+ADD)
+    # get the pod ip range
+    podcidr=$(echo $config | jq -r ".podcidr")
+    podcidr_gw=$(echo $podcidr | sed "s:0/$net_mask:1:g")
+
+    # create a vxlan interface
+    ip link add vxlan_interface type vxlan id 10 group 239.1.1.1 dstport 0 dev $main_interface
+    # create a bridge
+    ip link add cni0 type bridge
+    ip link set cni0 up
+    # assign ip address to the bridge
+    ip addr add "${podcidr_gw}/$net_mask" dev cni0
+
+    # assign the master of the bridge, the vxlan we created
+    ip link set vxlan_interface master cni0
+    ip link set vxlan_interface up
+
+     
+    # calculate $ip for the container
+    if [ -f /tmp/last_allocated_ip ]; then
+        n=`cat /tmp/last_allocated_ip`
+    else
+        n=1
+    fi
+    n=$(($n+1))
+
+    # the calculated container ip
+    ip=$(echo $podcidr | sed "s:0/24:$n:g")
+    echo $n > /tmp/last_allocated_ip
+    
+    # create a new virtual Ethernet device pair,
+    host_ifname="veth$n"
+    ip link add $CNI_IFNAME type veth peer name $host_ifname
+    ip link set $host_ifname up
+    
+    mkdir -p /var/run/netns/
+    # sets the network namespace device represented by $host_ifname as a member of the network bridge cni0. 
+    ip link set $host_ifname master cni0
+    # create symbolic link to the container namespace
+    ln -sfT $CNI_NETNS /var/run/netns/$CNI_CONTAINERID
+    # sets the network namespace device represented by $host_ifname as a member of the network bridge cni0. 
+    ip link set $CNI_IFNAME netns $CNI_CONTAINERID
+    
+    # configure the ip and route to the container interface
+    ip netns exec $CNI_CONTAINERID ip link set $CNI_IFNAME up
+    ip netns exec $CNI_CONTAINERID ip addr add $ip/24 dev $CNI_IFNAME
+    ip netns exec $CNI_CONTAINERID ip route add default via $podcidr_gw
+
+    # configure plugin log format
+    mac=$(ip netns exec $CNI_CONTAINERID ip link show eth0 | awk '/ether/ {print $2}')
+    address="${ip}/24"
+    output_template='
+{
+  "cniVersion": "0.3.1",
+  "interfaces": [                                            
+      {
+          "name": "%s",
+          "mac": "%s",                            
+          "sandbox": "%s" 
+      }
+  ],
+  "ips": [
+      {
+          "version": "4",
+          "address": "%s",
+          "gateway": "%s",          
+          "interface": 0 
+      }
+  ]
+}' 
+
+    output=$(printf "${output_template}" $CNI_IFNAME $mac $CNI_NETNS $address $podcidr_gw)
+    echo $output >> $log
+    echo "$output"
+    # add firewall rules
+    configure_host_firewall
+    
+;;
+
+DEL)
+    # if the container delete we will execute the following commands
+    # delete the bridge interface
+    rm -rf /var/run/netns/$CNI_CONTAINERID
+;;
+
+GET)
+;;
+
+VERSION)
+echo '{
+  "cniVersion": "0.3.1", 
+  "supportedVersions": [ "0.3.0", "0.3.1", "0.4.0" ] 
+}'
+;;
+
+*)
+  echo "Unknown cni command: $CNI_COMMAND" 
+  exit 1
+;;
+
+esac
