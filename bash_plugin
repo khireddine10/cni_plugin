@@ -107,7 +107,7 @@ ADD)
 
 DEL)
     # if the container delete we will execute the following commands
-    # delete the bridge interface
+    # delete the symbolic link and container namespace
     rm -rf /var/run/netns/$CNI_CONTAINERID
 ;;
 
